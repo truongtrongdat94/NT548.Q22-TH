@@ -1,0 +1,24 @@
+# Example Terraform Variables File
+# Copy this file to terraform.tfvars and update with your values
+
+aws_region          = "us-east-1"
+vpc_cidr            = "10.0.0.0/16"
+public_subnet_cidr  = "10.0.1.0/24"
+private_subnet_cidr = "10.0.2.0/24"
+availability_zone   = "us-east-1a"
+
+# Replace with your actual IP address
+# To get your IP: curl ifconfig.me
+my_ip = "0.0.0.0/32"  # CHANGE THIS!
+
+# Replace with your AWS key pair name
+key_name = "your-key-pair-name"  # CHANGE THIS!
+
+# EC2 Configuration
+instance_type = "t2.micro"
+
+# Amazon Linux 2023 AMI IDs by region:
+# us-east-1: ami-0c02fb55a2825a6dd
+# us-west-2: ami-0efcece6bed30fd98
+# ap-southeast-1: ami-0dc2d3e4c0f9ebd18
+ami_id = "ami-0c02fb55a2825a6dd"
