@@ -1,0 +1,132 @@
+name: Reusable – Backend
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment (dev or prod) — used to fetch SSM env vars for the smoke test.'
+        type: string
+        default: 'dev'
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      RPC_URL:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS
+        uses: ./.github/actions/setup-aws
+        with:
+          aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+          aws_region: ${{ vars.AWS_REGION }}
+          role_name: ${{ vars.AWS_OIDC_ROLE_NAME }}
+
+      - name: Set environment variables
+        run: |
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "ECR_BACKEND_REPOSITORY=${{ vars.ECR_BACKEND_REPOSITORY }}" >> $GITHUB_ENV
+          
+          # Build ECR URL
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ECR_BACKEND_REPOSITORY_URL=${AWS_ACCOUNT_ID}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_BACKEND_REPOSITORY }}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image (load + optional push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production
+          load: true
+          push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (/health)
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}"
+          ENVIRONMENT="${{ inputs.environment }}"
+
+          # env-file (not -e) so values with spaces/special chars survive intact.
+          ENV_FILE=$(mktemp)
+          trap "rm -f $ENV_FILE" EXIT
+
+          aws ssm get-parameters-by-path \
+            --path "/eventfund/${ENVIRONMENT}/backend" \
+            --recursive \
+            --with-decryption \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Parameters[*].[Name,Value]' \
+            --output json | \
+          jq -r '.[] | (.[0] | split("/") | last) + "=" + .[1]' > "$ENV_FILE"
+
+          docker run -d \
+            --name backend-test \
+            -p 4000:4000 \
+            --env-file "$ENV_FILE" \
+            "$IMAGE_TAG"
+
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:4000/health" | jq -e '.ok == true' >/dev/null 2>&1; then
+              echo "Health check passed"
+              docker stop backend-test
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "Health check failed"
+          docker logs --tail 100 backend-test
+          docker stop backend-test
+          exit 1
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+        env:
+          TRIVY_NO_PROGRESS: 'true'
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif

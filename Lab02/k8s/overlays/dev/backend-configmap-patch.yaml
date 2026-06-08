@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eventfund-backend-config
+data:
+  NODE_ENV: "DEV"
+  PORT: "4000"
+  LOG_LEVEL: "info"
+  AUTO_EVENT_LIFECYCLE_ENABLED: "true"
+  AUTO_EVENT_LIFECYCLE_INTERVAL_MS: "60000"
+  AUTO_EVENT_LIFECYCLE_SCAN_LIMIT: "50"
+  AUTO_TICKETING_DEFAULT_TYPE: "standard"
+  CHAIN_LOG_CHUNK_SIZE: "500"
+  CONTRACTS_ARTIFACTS_DIR: "./artifacts"

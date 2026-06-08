@@ -1,0 +1,105 @@
+name: Reusable – Deploy Contracts (Sepolia)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (dev or prod) — determines SSM path prefix.'
+        type: string
+        default: 'dev'
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      SEPOLIA_RPC_URL:
+        required: true
+      PRIVATE_KEY:
+        required: true
+      ROYALTY_BPS:
+        required: false
+      DEPLOY_CONFIRMATIONS:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set environment variables
+        run: |
+          echo "NODE_VERSION=20.19.0" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: contracts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefix contracts
+
+      - name: Configure AWS
+        uses: ./.github/actions/setup-aws
+        with:
+          aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+          aws_region: ${{ vars.AWS_REGION }}
+          role_name: ${{ vars.AWS_OIDC_ROLE_NAME }}
+
+      - name: Deploy to Sepolia and update AWS Parameter Store
+        env:
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          ROYALTY_BPS: ${{ secrets.ROYALTY_BPS }}
+          DEPLOY_CONFIRMATIONS: ${{ secrets.DEPLOY_CONFIRMATIONS }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          echo "Deploying contracts to Sepolia for env: ${ENVIRONMENT}"
+          DEPLOY_OUTPUT=$(npm run --prefix contracts deploy:sepolia 2>&1)
+          echo "$DEPLOY_OUTPUT"
+
+          TICKET_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep -oP 'TICKET_ADDRESS=\K0x[a-fA-F0-9]{40}' | head -1)
+          FUND_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep -oP 'FUND_ADDRESS=\K0x[a-fA-F0-9]{40}' | head -1)
+          MARKETPLACE_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep -oP 'MARKETPLACE_ADDRESS=\K0x[a-fA-F0-9]{40}' | head -1)
+
+          if [ -z "$TICKET_ADDRESS" ] || [ -z "$FUND_ADDRESS" ] || [ -z "$MARKETPLACE_ADDRESS" ]; then
+            echo "Failed to extract contract addresses from deploy output"
+            exit 1
+          fi
+
+          echo "Extracted addresses:"
+          echo "  TICKET_ADDRESS:      $TICKET_ADDRESS"
+          echo "  FUND_ADDRESS:        $FUND_ADDRESS"
+          echo "  MARKETPLACE_ADDRESS: $MARKETPLACE_ADDRESS"
+
+          put_param() {
+            local name="$1"
+            local value="$2"
+            aws ssm put-parameter \
+              --name "/eventfund/${ENVIRONMENT}/${name}" \
+              --value "$value" \
+              --type "SecureString" \
+              --overwrite \
+              --region "${AWS_REGION}"
+            echo "Updated /eventfund/${ENVIRONMENT}/${name}"
+          }
+
+          put_param TICKET_ADDRESS      "$TICKET_ADDRESS"
+          put_param FUND_ADDRESS        "$FUND_ADDRESS"
+          put_param MARKETPLACE_ADDRESS "$MARKETPLACE_ADDRESS"
+
+          echo "All contract addresses updated in AWS Parameter Store for env: ${ENVIRONMENT}"

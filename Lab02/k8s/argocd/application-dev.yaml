@@ -1,0 +1,34 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eventfund-dev
+  namespace: argocd
+  labels:
+    environment: dev
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/truongtrongdat94/Eventfund-platform.git
+    targetRevision: dev  # Dev environment uses dev branch
+    path: k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: eventfund-dev
+  syncPolicy:
+    automated:
+      prune: true      # xóa resource không còn trong Git
+      selfHeal: true   # tự fix nếu ai đó sửa trực tiếp trên cluster
+    syncOptions:
+      - CreateNamespace=true
+  # Argo Rollouts manages Service selectors (blue/green traffic switch) and Rollout
+  # replica counts at runtime. Without these exclusions, selfHeal would overwrite
+  # Rollouts' traffic routing on every sync, breaking blue-green and auto-rollback.
+  ignoreDifferences:
+    - group: ""
+      kind: Service
+      jqPathExpressions:
+        - .spec.selector["rollouts-pod-template-hash"]
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas

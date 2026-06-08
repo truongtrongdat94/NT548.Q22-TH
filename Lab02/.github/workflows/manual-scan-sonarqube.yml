@@ -1,0 +1,29 @@
+name: Manual – SonarQube Full Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to scan'
+        required: false
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - dev
+
+permissions:
+  contents: read
+  pull-requests: read  
+
+jobs:
+  sonarqube-scan:
+    uses: ./.github/workflows/reusable-scan-sonarqube.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      branch: ${{ inputs.branch }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

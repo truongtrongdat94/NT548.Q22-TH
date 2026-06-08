@@ -1,0 +1,166 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image_tag:   ${{ github.event.workflow_run.head_sha }}
+      environment: ${{ steps.env.outputs.environment }}
+      backend:     ${{ steps.changes.outputs.backend }}
+      frontend:    ${{ steps.changes.outputs.frontend }}
+    steps:
+      - name: Determine environment from branch
+        id: env
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          if [ "$BRANCH" = "master" ]; then
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=dev" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved environment for branch ${BRANCH}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Get parent commit
+        id: parent
+        run: |
+          PARENT_SHA=$(git rev-parse ${{ github.event.workflow_run.head_sha }}^)
+          echo "sha=${PARENT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed services
+        id: changes
+        run: |
+          PARENT="${{ steps.parent.outputs.sha }}"
+          HEAD="${{ github.event.workflow_run.head_sha }}"
+          git fetch --depth=1 --no-tags origin "$PARENT"
+          BACKEND=$(git diff --name-only "$PARENT" "$HEAD" | grep -c '^backend/' || true)
+          FRONTEND=$(git diff --name-only "$PARENT" "$HEAD" | grep -c '^frontend/' || true)
+          echo "backend=$([ "$BACKEND" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "frontend=$([ "$FRONTEND" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  deploy-backend:
+    needs: check
+    if: needs.check.outputs.backend == 'true'
+    uses: ./.github/workflows/reusable-deploy-backend.yml
+    permissions:
+      contents: write
+      id-token: write
+    with:
+      image_tag: ${{ needs.check.outputs.image_tag }}
+      environment: ${{ needs.check.outputs.environment }}
+      branch: ${{ github.event.workflow_run.head_branch }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  deploy-frontend:
+    needs: check
+    if: needs.check.outputs.frontend == 'true'
+    uses: ./.github/workflows/reusable-deploy-frontend.yml
+    permissions:
+      contents: read
+      id-token: write
+      actions: read  
+    with:
+      image_tag: ${{ needs.check.outputs.image_tag }}
+      environment: ${{ needs.check.outputs.environment }}
+      workflow_run_id: ${{ github.event.workflow_run.id }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  notify:
+    needs: [check, deploy-backend, deploy-frontend]
+    if: always() && needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ needs.check.outputs.environment }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          BACKEND_RESULT: ${{ needs.deploy-backend.result }}
+          FRONTEND_RESULT: ${{ needs.deploy-frontend.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "DISCORD_WEBHOOK_URL not configured — skipping notification."
+            exit 0
+          fi
+
+          # Treat 'skipped' as success (no changes in that service).
+          # Treat 'failure' or 'cancelled' as a problem worth flagging.
+          status_icon() {
+            case "$1" in
+              success|skipped) echo "success" ;;
+              failure)         echo "failure" ;;
+              cancelled)       echo "cancelled" ;;
+              *)               echo "other" ;;
+            esac
+          }
+
+          OVERALL="success"
+          if [ "${BACKEND_RESULT}" = "failure" ] || [ "${FRONTEND_RESULT}" = "failure" ] \
+             || [ "${BACKEND_RESULT}" = "cancelled" ] || [ "${FRONTEND_RESULT}" = "cancelled" ]; then
+            OVERALL="failure"
+          fi
+
+          COLOR=3066993   # green
+          if [ "${OVERALL}" = "failure" ]; then
+            COLOR=15158332 # red
+          fi
+
+          BACKEND_ICON=$(status_icon "${BACKEND_RESULT}")
+          FRONTEND_ICON=$(status_icon "${FRONTEND_RESULT}")
+
+          SHORT_SHA="${SHA:0:7}"
+
+          payload=$(jq -n \
+            --arg title "Deploy ${ENVIRONMENT^^} — ${OVERALL}" \
+            --arg url "${RUN_URL}" \
+            --arg branch "${BRANCH}" \
+            --arg sha "${SHORT_SHA}" \
+            --arg backend "${BACKEND_ICON} ${BACKEND_RESULT}" \
+            --arg frontend "${FRONTEND_ICON} ${FRONTEND_RESULT}" \
+            --argjson color "${COLOR}" \
+            '{
+              embeds: [{
+                title: $title,
+                url: $url,
+                color: $color,
+                fields: [
+                  { name: "Branch",   value: $branch,   inline: true },
+                  { name: "Commit",   value: $sha,      inline: true },
+                  { name: "Backend",  value: $backend,  inline: true },
+                  { name: "Frontend", value: $frontend, inline: true }
+                ]
+              }]
+            }')
+
+          curl -fsS -H "Content-Type: application/json" \
+            -X POST -d "${payload}" "${DISCORD_WEBHOOK_URL}" >/dev/null
+
+          echo "Discord notification sent (overall: ${OVERALL})."

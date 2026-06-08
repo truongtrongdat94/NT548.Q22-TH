@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, master]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'contracts/**'
+      - '.github/actions/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/reusable-*.yml'
+      - 'package-lock.json'
+      - 'docker-compose.yml'
+  pull_request:
+    branches: [dev, master]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'contracts/**'
+      - '.github/actions/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/reusable-*.yml'
+      - 'package-lock.json'
+      - 'docker-compose.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend:   ${{ steps.filter.outputs.backend }}
+      frontend:  ${{ steps.filter.outputs.frontend }}
+      contracts: ${{ steps.filter.outputs.contracts }}
+      shared:    ${{ steps.filter.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          base: ${{ github.event_name == 'push' && github.event.before || '' }}
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'frontend/**'
+            contracts:
+              - 'contracts/**'
+            shared:
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/reusable-*.yml'
+              - 'package-lock.json'
+              - 'docker-compose.yml'
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.shared == 'true'
+    uses: ./.github/workflows/reusable-build-frontend.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: ${{ github.ref_name == 'master' && 'prod' || 'dev' }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  contracts:
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true' || needs.changes.outputs.shared == 'true'
+    uses: ./.github/workflows/reusable-build-contracts.yml
+
+  backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.shared == 'true'
+    uses: ./.github/workflows/reusable-build-backend.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      environment: ${{ github.ref_name == 'master' && 'prod' || 'dev' }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      RPC_URL: ${{ secrets.RPC_URL }}
+
+  sonarcloud:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.shared == 'true'
+    uses: ./.github/workflows/reusable-scan-sonarqube.yml
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    with:
+      branch: ${{ github.ref_name }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

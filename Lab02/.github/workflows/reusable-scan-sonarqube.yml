@@ -1,0 +1,95 @@
+name: Reusable – SonarQube Scan
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Branch name for branch analysis (used when not a pull_request event).'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set environment variables
+        run: |
+          echo "SONARCLOUD_BASE_URL=https://sonarcloud.io" >> $GITHUB_ENV
+          echo "SONARCLOUD_PROJECT_KEY=truongtrongdat94_eventfund-platform" >> $GITHUB_ENV
+          echo "SONARCLOUD_ORGANIZATION=truongtrongdat94" >> $GITHUB_ENV
+
+      - name: Set Sonar server URL
+        id: sonar_url
+        run: |
+          URL="${{ secrets.SONAR_HOST_URL }}"
+          if [ -z "$URL" ]; then
+            URL="${{ env.SONARCLOUD_BASE_URL }}"
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Build SonarQube args
+        id: sonar_args
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BRANCH_NAME: ${{ inputs.branch }}
+          PROJECT_KEY: ${{ env.SONARCLOUD_PROJECT_KEY }}
+          ORGANIZATION: ${{ env.SONARCLOUD_ORGANIZATION }}
+        run: |
+          set -euo pipefail
+
+          ARGS="-Dsonar.projectKey=${PROJECT_KEY} -Dsonar.organization=${ORGANIZATION} -Dsonar.sources=backend/src,frontend/src -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/coverage/**"
+
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${PR_NUMBER}" ]; then
+            ARGS="${ARGS} -Dsonar.pullrequest.key=${PR_NUMBER} -Dsonar.pullrequest.branch=${PR_HEAD_REF} -Dsonar.pullrequest.base=${PR_BASE_REF}"
+          elif [ -n "${BRANCH_NAME}" ]; then
+            ARGS="${ARGS} -Dsonar.branch.name=${BRANCH_NAME}"
+          fi
+
+          echo "args=${ARGS}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v7.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.sonar_url.outputs.url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ steps.sonar_args.outputs.args }}
+
+      - name: SonarQube Quality Gate check
+        if: github.event_name != 'push'
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.sonar_url.outputs.url }}
+
+      - name: Upload scan metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-scan-metadata-${{ github.run_id }}
+          path: .scannerwork/report-task.txt
+          if-no-files-found: ignore
+          retention-days: 7
